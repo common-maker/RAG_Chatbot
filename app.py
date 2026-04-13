@@ -1,98 +1,114 @@
+"""
+Chainlit application for A-RAG Chatbot (arXiv:2602.03442).
 
-import os
+Changes from previous version:
+- arag_tools replaced by context_holder (ContextHolder from engine.py).
+- context_holder.reset() clears the AgentContext at the start of each query.
+- Source attribution reads context_holder.read_chunks (same API, cleaner name).
+- Streaming fallback for agents that don't support async_response_gen.
+"""
+
 import chainlit as cl
-
-from llama_index.core import (
-    Settings,
-    StorageContext,
-    VectorStoreIndex,
-    SimpleDirectoryReader,
-    load_index_from_storage,
-)
-from llama_index.llms.openai import OpenAI
-from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import Settings
 from llama_index.core.callbacks import CallbackManager
-from dotenv import load_dotenv
+from llama_index.embeddings.openai import OpenAIEmbedding
 
-# 1. Load Environment Variables
-load_dotenv()
+from engine import get_chat_engine
+from logger import setup_logger
 
-# 2. GLOBAL SETTINGS (LlamaIndex v0.10+)
-# Configure these once at startup, not inside every user session
-Settings.llm = OpenAI(
-    model="gpt-4o-mini",  # Updated to a newer/faster model
-    temperature=0.1,
-    max_tokens=1024
-)
-Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-small")
-Settings.context_window = 4096
+logger = setup_logger(__name__, "app.log")
+
+Settings.embed_model = OpenAIEmbedding(model="text-embedding-3-large")
+
 
 @cl.on_chat_start
 async def start():
-    # 3. Connect Chainlit UI Trace to LlamaIndex
-    # This allows you to see the "Steps" in the Chainlit UI
+    logger.info("New chat session started.")
     Settings.callback_manager = CallbackManager([cl.LlamaIndexCallbackHandler()])
+    await cl.Message(content="🔄 Initialising A-RAG engine…").send()
 
-    # 4. Load or Build Index
-    # Check if storage exists first to avoid try/except block masking other errors
-    if os.path.exists("./storage"):
-        try:
-            storage_context = StorageContext.from_defaults(persist_dir="./storage")
-            index = load_index_from_storage(storage_context)
-            await cl.Message(content="Loaded index from disk.").send()
-        except Exception as e:
-            await cl.Message(content=f"Error loading index: {e}").send()
-            return
-    else:
-        # First run: Build index from data
-        await cl.Message(content="Building index... this may take a moment.").send()
-        if not os.path.exists("./data"):
-            os.makedirs("./data") # Safety creation
-            
-        documents = SimpleDirectoryReader("./data").load_data(show_progress=True)
-        index = VectorStoreIndex.from_documents(documents)
-        index.storage_context.persist(persist_dir="./storage")
-        await cl.Message(content="Index built and saved!").send()
+    try:
+        agent, context_holder = get_chat_engine()
+        cl.user_session.set("agent", agent)
+        cl.user_session.set("context_holder", context_holder)
 
-    # 5. Create Query Engine
-    # Streaming=True is crucial for a chatty feel
-    query_engine = index.as_query_engine(
-        streaming=True, 
-        similarity_top_k=2
-    )
-    cl.user_session.set("query_engine", query_engine)
+        await cl.Message(
+            content=(
+                "✅ **A-RAG Ready!**\n\n"
+                "I answer questions about your documents using multi-step retrieval — "
+                "searching, reading, and reasoning over the full corpus before responding.\n\n"
+                "Ask me anything about your documents."
+            )
+        ).send()
 
-    await cl.Message(
-        author="Assistant", 
-        content="Hello! I'm ready to chat about your data."
-    ).send()
+    except FileNotFoundError as e:
+        logger.error(f"Engine init failed (missing files): {e}")
+        await cl.Message(
+            content=(
+                f"❌ **Initialisation failed:** {e}\n\n"
+                "Run `DynamicSectionRetrieverIngestion.py` to ingest your documents first."
+            )
+        ).send()
+
+    except Exception as e:
+        logger.error(f"Engine init failed: {e}", exc_info=True)
+        await cl.Message(content=f"❌ Initialisation error: {e}").send()
 
 
 @cl.on_message
 async def main(message: cl.Message):
-    query_engine = cl.user_session.get("query_engine")
-    
-    msg = cl.Message(content="", author="Assistant")
+    logger.info(f"Received: {message.content}")
 
-    # 6. Native Async Query & Streaming
-    # Use 'aquery' (async query) instead of wrapping the sync 'query'
-    response = await query_engine.aquery(message.content)
+    agent = cl.user_session.get("agent")
+    context_holder = cl.user_session.get("context_holder")
 
-    # Stream the tokens as they arrive
-    async for token in response.async_response_gen():
-        await msg.stream_token(token)
+    if not agent:
+        await cl.Message(
+            content="❌ Agent not initialised. Please refresh the page."
+        ).send()
+        return
 
-    # 7. (Optional) Show Sources
-    # If you want to show WHICH file the answer came from:
-    source_names = set()
-    for node in response.source_nodes:
-        # Get filename from metadata
-        file_name = node.metadata.get("file_name", "Unknown Source")
-        source_names.add(file_name)
-    
-    if source_names:
-        await msg.stream_token(f"\n\n**Sources:** {', '.join(source_names)}")
+    # Reset per-query state: clears chunk-read tracker and retrieval log.
+    if context_holder:
+        context_holder.reset()
 
-    await msg.send()
+    msg = cl.Message(content="", author="A-RAG Assistant")
 
-    
+    try:
+        response = await agent.astream_chat(message.content)
+
+        # Stream answer tokens; fall back to a direct send if streaming is unavailable.
+        if hasattr(response, "async_response_gen"):
+            async for token in response.async_response_gen():
+                await msg.stream_token(token)
+        else:
+            response_text = getattr(response, "response", str(response))
+            await msg.stream_token(response_text)
+
+        # Append source attribution: which chunks were fully read.
+        if context_holder and context_holder.read_chunks:
+            read_ids = sorted(
+                context_holder.read_chunks,
+                key=lambda x: int(x) if x.isdigit() else x,
+            )
+            max_shown = 10
+            shown = read_ids[:max_shown]
+            overflow = len(read_ids) - max_shown
+
+            sources_text = "\n\n---\n**📚 Chunks Read:**\n" + "\n".join(
+                f"- Chunk {cid}" for cid in shown
+            )
+            if overflow > 0:
+                sources_text += f"\n- … and {overflow} more"
+
+            await msg.stream_token(sources_text)
+
+        await msg.send()
+
+    except Exception as e:
+        logger.error(f"Error during chat: {e}", exc_info=True)
+        if not msg.content:
+            await cl.Message(content=f"❌ Error: {e}").send()
+        else:
+            await msg.stream_token(f"\n\n❌ Error: {e}")
+            await msg.send()
